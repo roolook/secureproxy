@@ -7,55 +7,68 @@ const { URL } = require('url');
 
 const app = express();
 const PROXY_HOST = process.env.PROXY_HOST || 'secureproxy-2.onrender.com';
-const TARGET = 'https://www.youtube.com';
 
 // 1) CORS & rate limiting
 app.use(cors());
-app.use(rateLimit({ windowMs:15*60*1000, max:200 }));
+app.use(rateLimit({ windowMs: 15*60*1000, max: 300 }));
 
 // 2) Allow iframe embedding
-app.use((req, res, next) => {
-  res.removeHeader('X-Frame-Options');
-  next();
-});
+app.use((req, res, next) => { res.removeHeader('X-Frame-Options'); next(); });
 
-// 3) Proxy with redirect & cookie rewriting + HTML link rewrite
+// 3) Universal router: first path segment = hostname
 app.use('/', createProxyMiddleware({
-  target: TARGET,
   changeOrigin: true,
   selfHandleResponse: true,
 
+  // Choose target based on the first path segment
+  router: req => {
+    const m = req.url.match(/^\/([^\/]+)(?:\/|$)/);
+    return m
+      ? `https://${m[1]}`
+      : `https://www.youtube.com`; // fallback
+  },
+
+  // Strip the first segment before proxying
+  pathRewrite: (path, req) => {
+    const m = path.match(/^\/([^\/]+)(\/.*|$)/);
+    return m ? (m[2] || '/') : path;
+  },
+
   onProxyRes: responseInterceptor(async (buffer, proxyRes, req, res) => {
-    // A) Rewrite Location header
-    if (proxyRes.headers.location) {
+    // A) Rewrite Location headers
+    const loc = proxyRes.headers.location;
+    if (loc) {
       try {
-        const u = new URL(proxyRes.headers.location);
-        proxyRes.headers.location = `https://${PROXY_HOST}${u.pathname}${u.search}`;
+        const u = new URL(loc);
+        // rebuild so the client stays under our proxy
+        proxyRes.headers.location = `https://${PROXY_HOST}/${u.host}${u.pathname}${u.search}`;
       } catch {}
     }
 
     // B) Rewrite Set-Cookie domains
     if (proxyRes.headers['set-cookie']) {
-      proxyRes.headers['set-cookie'] = proxyRes.headers['set-cookie'].map(cookie =>
-        cookie
-          .replace(/Domain=[^;]+;?/gi, '')
-          .replace(/;?\s*Secure/gi, '')
-          .concat(`; Domain=${PROXY_HOST}; Secure`)
+      proxyRes.headers['set-cookie'] = proxyRes.headers['set-cookie'].map(c =>
+        c.replace(/Domain=[^;]+;?/i, '')
+         .replace(/;?\s*Secure/gi, '')
+         .concat(`; Domain=${PROXY_HOST}; Secure`)
       );
     }
 
-    // C) If HTML, rewrite in-page youtube.com → proxy
-    const ct = proxyRes.headers['content-type'] || '';
+    // C) If HTML, rewrite inline links
+    const ct = proxyRes.headers['content-type']||'';
     if (ct.includes('text/html')) {
       let html = buffer.toString('utf8');
-      html = html.replace(/https:\/\/(www\.)?youtube\.com/gi, `https://${PROXY_HOST}`);
+      // rewrite any hard‑coded https://*.google.com or youtube.com links
+      html = html.replace(
+        /https:\/\/([a-z0-9\-\.]+\.google\.com|www\.youtube\.com)/gi,
+        (_, host) => `https://${PROXY_HOST}/${host}`
+      );
       return Buffer.from(html, 'utf8');
     }
 
-    // D) Otherwise, return untouched
     return buffer;
   })
 }));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Proxy up on ${PORT}, to ${TARGET}`));
+app.listen(PORT, () => console.log(`Proxy listening on ${PORT}`));
