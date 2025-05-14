@@ -15,8 +15,8 @@ const limiter = rateLimit({
 });
 app.use(limiter);
 
-// Secure proxy setup
-const target = process.env.TARGET_URL || 'https://youtube.com';
+// Proxy setup - YouTube
+const target = 'https://www.youtube.com';
 
 app.use('/', createProxyMiddleware({
   target,
