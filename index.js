@@ -1,43 +1,84 @@
+// index.js
 const express = require('express');
-const { createProxyMiddleware } = require('http-proxy-middleware');
-const cors = require('cors');
+const {
+  createProxyMiddleware,
+  responseInterceptor,
+} = require('http-proxy-middleware');
 const rateLimit = require('express-rate-limit');
+const cors = require('cors');
+const URL = require('url').URL;
 
 const app = express();
+const PROXY_HOST = process.env.PROXY_HOST || 'secureproxy-2.onrender.com';
+const TARGET = 'https://www.youtube.com';
 
-// Allow all origins (you can restrict this later)
+// 1. CORS & rate limiting
 app.use(cors());
+app.use(
+  rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 200,
+  })
+);
 
-// Rate limiter: 100 requests per 15 minutes per IP
-const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100 // Max 100 requests per IP per window
-});
-app.use(limiter);
-
-// Remove X-Frame-Options header to allow embedding
+// 2. Remove X-Frame-Options so you can embed
 app.use((req, res, next) => {
-  res.removeHeader("X-Frame-Options");  // Allow embedding
+  res.removeHeader('X-Frame-Options');
   next();
 });
 
-// Proxy to YouTube
-const target = 'https://www.youtube.com';
+// 3. The proxy itself
+app.use(
+  '/',
+  createProxyMiddleware({
+    target: TARGET,
+    changeOrigin: true,
+    selfHandleResponse: true,
 
-app.use('/', createProxyMiddleware({
-  target,
-  changeOrigin: true,
-  pathRewrite: (path, req) => {
-    // Rewrite all relative paths to include the proxy URL
-    return path.replace(/^\/?/, '/');
-  },
-  onProxyReq: (proxyReq, req, res) => {
-    // Change all absolute links to stay within the proxy
-    proxyReq.setHeader('Host', 'www.youtube.com');  // Ensure it's proxied through YouTube
-  },
-}));
+    // A) Handle redirects back through proxy
+    onProxyRes(proxyRes, req, res) {
+      // 3.A.1 Rewrite Location headers
+      const loc = proxyRes.headers['location'];
+      if (loc) {
+        try {
+          const u = new URL(loc);
+          // rebuild the URL to go via your proxy
+          proxyRes.headers['location'] = `https://${PROXY_HOST}${u.pathname}${u.search}`;
+        } catch (e) {}
+      }
 
-const port = process.env.PORT || 3000;
-app.listen(port, () => {
-  console.log(`Proxy running on port ${port}, forwarding to ${target}`);
-});
+      // 3.A.2 Rewrite Set-Cookie domains
+      const cookies = proxyRes.headers['set-cookie'];
+      if (cookies) {
+        proxyRes.headers['set-cookie'] = cookies.map((cookie) =>
+          // strip Domain=... and add our proxy domain instead
+          cookie
+            .replace(/Domain=[^;]+;?/gi, '')
+            .replace(/;?\s*Secure/gi, '') + `; Domain=${PROXY_HOST}; Secure`
+        );
+      }
+    },
+
+    // B) Intercept HTML/JS and rewrite any in‑page youtube.com links
+    //    (WARNING: may break some dynamic scripts!)
+    onProxyRes: responseInterceptor(async (responseBuffer, proxyRes, req, res) => {
+      const contentType = proxyRes.headers['content-type'] || '';
+      if (contentType.includes('text/html')) {
+        let html = responseBuffer.toString('utf8');
+        // Rewrite absolute links in the HTML
+        html = html.replace(
+          /https:\/\/(www\.)?youtube\.com/gi,
+          `https://${PROXY_HOST}`
+        );
+        return Buffer.from(html, 'utf8');
+      }
+      // otherwise, return unmodified
+      return responseBuffer;
+    }),
+  })
+);
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () =>
+  console.log(`Proxy listening on ${PORT}, forwarding to ${TARGET}`)
+);
